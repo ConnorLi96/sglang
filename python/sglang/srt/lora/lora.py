@@ -89,9 +89,17 @@ class LoRAAdapter(nn.Module):
             match = re.search(r"layers\.(\d+)\.", name)
             if match is not None:
                 layer_id = int(match.group(1))
-                self.layers[layer_id].weights[name] = loaded_weight.cpu()
+                # Use pinned memory for faster async CPU→GPU transfer
+                cpu_weight = loaded_weight.cpu()
+                pinned_weight = torch.empty(cpu_weight.shape, dtype=cpu_weight.dtype, pin_memory=True)
+                pinned_weight.copy_(cpu_weight)
+                self.layers[layer_id].weights[name] = pinned_weight
             else:
-                self.weights[name] = loaded_weight.cpu()
+                # Use pinned memory for faster async CPU→GPU transfer
+                cpu_weight = loaded_weight.cpu()
+                pinned_weight = torch.empty(cpu_weight.shape, dtype=cpu_weight.dtype, pin_memory=True)
+                pinned_weight.copy_(cpu_weight)
+                self.weights[name] = pinned_weight
 
         # normalize kv_proj and gate_up_proj
         for layer in self.layers:

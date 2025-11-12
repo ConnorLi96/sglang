@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -86,6 +87,9 @@ class LoRAMemoryPool:
         self.buffer_id_to_uid: List[Union[str, None, EmptySlot]] = [
             EMPTY_SLOT
         ] * self.max_loras_per_batch
+
+        # Create a dedicated CUDA stream for async LoRA loading
+        self.load_stream = torch.cuda.Stream()
 
         self.init_buffers(base_model)
 
@@ -193,6 +197,9 @@ class LoRAMemoryPool:
         lora_modules: List[Dict[str, BaseLayerWithLoRA]],
         lora_refs: Dict[str, LoRARef],
     ):
+        start_time = time.perf_counter()
+        num_loaded = 0
+        
         def get_available_buffer_slot():
             # 1. Prioritize empty slots
             for buffer_id in range(self.max_loras_per_batch):
@@ -241,6 +248,7 @@ class LoRAMemoryPool:
 
         for uid in cur_uids:
             if uid not in self.uid_to_buffer_id:
+                load_start = time.perf_counter()
                 buffer_id = get_available_buffer_slot()
                 lora_adapter = lora_adapters.get(uid, None)
                 self.load_lora_weight_to_buffer(
@@ -248,6 +256,17 @@ class LoRAMemoryPool:
                 )
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
+                num_loaded += 1
+                load_time = (time.perf_counter() - load_start) * 1000
+                logger.info(f"🔴 LoRA loading: {load_time:.2f}ms, uid={uid}")
+        
+        # Synchronize to ensure all async LoRA loading completes before forward pass
+        if num_loaded > 0:
+            torch.cuda.current_stream().wait_stream(self.load_stream)
+        
+        total_time = (time.perf_counter() - start_time) * 1000
+        if num_loaded > 0:
+            logger.info(f"📊 Total prepare_lora_batch: {total_time:.2f}ms, loaded {num_loaded} adapters")
 
     def load_lora_weight_to_buffer(
         self,
@@ -267,7 +286,7 @@ class LoRAMemoryPool:
                 assert (
                     buffer_view.shape == weight.shape
                 ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
-                buffer_view.copy_(weight)
+                buffer_view.copy_(weight, non_blocking=True)
 
         if uid is None:
             for i in range(self.num_layer):
@@ -277,49 +296,52 @@ class LoRAMemoryPool:
 
         assert lora_adapter is not None
         lora_rank = lora_adapter.config.r
-        for layer_id in range(self.num_layer):
-            layer_weights = lora_adapter.layers[layer_id].weights
-            temp_A_buffer: Dict[str, Optional[torch.Tensor]] = {
-                target_module: None for target_module in self.A_buffer
-            }
-            temp_B_buffer: Dict[str, Optional[torch.Tensor]] = {
-                target_module: None for target_module in self.B_buffer
-            }
-            for name, weights in layer_weights.items():
-                target_module = get_target_module_name(name, self.target_modules)
-                if "lora_A" in name:
-                    temp_A_buffer[target_module] = weights
-                else:
-                    temp_B_buffer[target_module] = weights
+        
+        # Use dedicated stream for async loading
+        with torch.cuda.stream(self.load_stream):
+            for layer_id in range(self.num_layer):
+                layer_weights = lora_adapter.layers[layer_id].weights
+                temp_A_buffer: Dict[str, Optional[torch.Tensor]] = {
+                    target_module: None for target_module in self.A_buffer
+                }
+                temp_B_buffer: Dict[str, Optional[torch.Tensor]] = {
+                    target_module: None for target_module in self.B_buffer
+                }
+                for name, weights in layer_weights.items():
+                    target_module = get_target_module_name(name, self.target_modules)
+                    if "lora_A" in name:
+                        temp_A_buffer[target_module] = weights
+                    else:
+                        temp_B_buffer[target_module] = weights
 
-            if self.tp_size > 1:
-                cur_layer_modules = lora_modules[layer_id]
-                for module_name, module in cur_layer_modules.items():
-                    target_module = get_target_module_name(
-                        module_name, self.target_modules
-                    )
+                if self.tp_size > 1:
+                    cur_layer_modules = lora_modules[layer_id]
+                    for module_name, module in cur_layer_modules.items():
+                        target_module = get_target_module_name(
+                            module_name, self.target_modules
+                        )
 
-                    if temp_A_buffer[target_module] is None:
-                        # Skip weight slicing if the weight is not present in the adapter
-                        continue
+                        if temp_A_buffer[target_module] is None:
+                            # Skip weight slicing if the weight is not present in the adapter
+                            continue
 
-                    temp_A_buffer[target_module] = module.slice_lora_a_weights(
-                        temp_A_buffer[target_module], self.tp_rank
-                    )
-                    temp_B_buffer[target_module] = module.slice_lora_b_weights(
-                        temp_B_buffer[target_module], self.tp_rank
-                    )
+                        temp_A_buffer[target_module] = module.slice_lora_a_weights(
+                            temp_A_buffer[target_module], self.tp_rank
+                        )
+                        temp_B_buffer[target_module] = module.slice_lora_b_weights(
+                            temp_B_buffer[target_module], self.tp_rank
+                        )
 
-            for name, weights in temp_A_buffer.items():
-                c = get_stacked_multiply(name)
-                target_buffer = self.A_buffer[name][layer_id]
-                buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
-                load_lora_weight_tensor(buffer_view, weights)
+                for name, weights in temp_A_buffer.items():
+                    c = get_stacked_multiply(name)
+                    target_buffer = self.A_buffer[name][layer_id]
+                    buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
+                    load_lora_weight_tensor(buffer_view, weights)
 
-            for name, weights in temp_B_buffer.items():
-                target_buffer = self.B_buffer[name][layer_id]
-                buffer_view = target_buffer[buffer_id, :, :lora_rank]
-                load_lora_weight_tensor(buffer_view, weights)
+                for name, weights in temp_B_buffer.items():
+                    target_buffer = self.B_buffer[name][layer_id]
+                    buffer_view = target_buffer[buffer_id, :, :lora_rank]
+                    load_lora_weight_tensor(buffer_view, weights)
 
     def get_tensor(
         self, target_module: str, layer_id: int, lora_type: LoRAType
