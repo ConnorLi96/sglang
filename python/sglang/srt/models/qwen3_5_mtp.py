@@ -48,6 +48,10 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         if self.is_multimodal:
             config = config.text_config
 
+        # The MTP model is unquantized in the nvfp4 checkpoint.
+        if quant_config and quant_config.get_name() == "modelopt_fp4":
+            quant_config = None
+
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
@@ -240,16 +244,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if "mtp" not in name:
                 continue
 
-            # Some checkpoints use model.language_model.mtp.* prefix
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
-
             if name.startswith("mtp."):
                 # Remove the mtp. prefix for processing
                 name = name.replace("mtp.", "model.")
 
                 name = name.replace("model.fc", "fc")
-                name = name.replace("model.norm", "norm")
                 name = name.replace("model.pre_fc", "pre_fc")
 
             if ".self_attn." in name:

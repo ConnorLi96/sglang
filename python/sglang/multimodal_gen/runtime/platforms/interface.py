@@ -46,6 +46,7 @@ class AttentionBackendEnum(enum.Enum):
         return self in {
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+            AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
             AttentionBackendEnum.VMOBA_ATTN,
             AttentionBackendEnum.SLA_ATTN,
             AttentionBackendEnum.SAGE_SLA_ATTN,
@@ -314,7 +315,7 @@ class Platform:
             random.seed(seed)
             np.random.seed(seed)
             torch.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
+            torch.get_device_module().manual_seed_all(seed)
 
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
